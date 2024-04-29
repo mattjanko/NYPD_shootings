@@ -1,0 +1,243 @@
+---
+title: "Seasonality in the Frequency of Shooting Incidents in New York"
+author: "Matt Janko"
+date: "`r Sys.Date()`"
+output:
+  pdf_document: default
+  html_document:
+    df_print: paged
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r libraries, include = FALSE, echo = TRUE}
+library(tidyverse)
+```
+
+## Introduction
+
+The frequencies of many forms of criminal behavior have seasonal components, with criminal behaviors often tending to become more frequent in warmer months than in cooler months. The goal of this analysis is to detect and to model seasonality in the frequency of shooting incidents in New York City during the years 2006–2023. 
+
+## Data import and cleaning
+
+The data used in this analysis was found at <https://data.cityofnewyork.us/api/views/833y-fsy8/rows.csv?accessType=DOWNLOAD>. The original file contains information about the date, time, and location of 27312 shooting incidents that took place in New York City between 2006 and 2023 as well as demographic information about shooters and victims. The current analysis will only examine dates and times of shooting incidents. The following code block imports the data and extracts a datetime for each shooting along with integers for year and month into a table called `shooting_datetimes`. 
+
+```{r data import, echo = TRUE}
+url <- "https://data.cityofnewyork.us/api/views/833y-fsy8/rows.csv?accessType=DOWNLOAD"
+shooting_incidents <- read.csv(url) # import data
+shooting_datetimes <- shooting_incidents[,c(2,3)] # extract date and times
+shooting_datetimes <- shooting_datetimes %>% 
+  mutate(
+    DATETIME = as.POSIXct( # convert date/time strings to datetimes
+      paste(OCCUR_DATE, OCCUR_TIME, sep = " "),
+      format = "%m/%d/%Y %H:%M:%S",
+      tz = "UTC-4"
+      ),
+    YEAR = as.integer(format.Date(DATETIME, "%Y")), # store year as an integer
+    MONTH = as.integer(format.Date(DATETIME, "%m")), # store month as an integer
+    )
+shooting_datetimes[,c(1,2)] <- NULL # delete redundant columns
+summary(shooting_datetimes)
+```
+
+## Shootings by month
+
+In the following code block, the data in `shooting_datetimes` is grouped by year and month, and the number of shootings is recorded for each year-month pair. Additionally, a date in the format "year-month-15" is recorded for each shooting count. This information is stored in `shootings_by_month` and is used to create a visualization of changes in shooting frequency between 2006 and 2023.
+
+```{r shootings by month, echo = TRUE}
+shootings_by_month <- shooting_datetimes %>% group_by(YEAR, MONTH) %>% 
+  summarise(NUM_OCCUR = n()) # count shootings in each month
+shootings_by_month <- shootings_by_month %>% mutate(
+  MONTH_AS_DATE = as.Date( # assign a date to each year-month pair
+    paste(YEAR, "-", MONTH, "-15", sep = ""),
+    format = "%Y-%m-%d"
+    )
+  )
+ggplot(data = shootings_by_month, mapping = aes(x = MONTH_AS_DATE, y = NUM_OCCUR)) +
+  geom_point() +
+  labs(x = "Date",
+    y = "Shooting count", 
+    title = "Shootings by month, 2006 - 2023"
+    )
+```
+
+## Modeling seasonality
+
+There is a lot of variability in the data, and some of the variability is plausibly due to seasonality. The following code block estimates seasonality by computing the mean number of shootings and variances for each month of the year. These values are stored in `monthly_averages`.
+
+```{r monthly averages, echo = TRUE}
+monthly_averages <- shootings_by_month %>% group_by(MONTH) %>% 
+  summarise( # record mean shooting counts and variance by month
+    MEAN  = mean(NUM_OCCUR),
+    VAR = var(NUM_OCCUR)
+    )
+monthly_averages
+ggplot(data = monthly_averages, mapping = aes(x = MONTH, y = MEAN)) +
+  geom_point() +
+  labs(x = "Month",
+    y = "Mean shooting count", 
+    title = "Mean shooting count by month of the year"
+    ) +
+  scale_x_continuous(breaks = 1:12)
+```
+
+### Nonlinear regression
+
+Based on the previous plot, a sinusoidal function seems to be a reasonable approximation of the seasonality. In the following code block, the true period of the seasonal effect is assumed to be 12 months, and the `nls` function produces a model `sinreg` with estimates of the amplitude, phase shift, and midline of the seasonal component of mean shooting count. These parameters are represented as `a`, `c`, and `d`, respectively. The month is represented as `x`, and the mean shooting count is represented as `y`. Half the range of `y` is used as a first approximation of `a`, 0 as a first approximation of `c`, and the mean of `y` as a first approximation of `d`.
+
+```{r sinusoidal regression, echo = TRUE}
+x <- monthly_averages$MONTH
+y <- monthly_averages$MEAN
+start_values <- c(a = 1/2*(max(y) - min(y)), c = 0, d = mean(y)) # first approximations
+sinreg <- nls(y ~ a*sin(2*pi*x/12 + c) + d, start = start_values)
+summary(sinreg)
+ggplot(monthly_averages, aes(x = MONTH, y = MEAN)) + geom_point() +
+  geom_smooth(
+    method = "nls", formula = y ~ a*sin(2*pi*x/12 + c) + d, 
+    method.args = list(start = start_values), 
+    se = FALSE
+    ) +
+  labs( x = "Month", 
+    y = "Mean shooting count", 
+    title = "Mean shooting count by month of the year"
+    ) +
+  scale_x_continuous(breaks = 1:12)
+```
+
+The following code block computes predicted mean numbers of shootings and residuals for `sinreg`.
+
+```{r residuals, echo = TRUE}
+a <- coef(sinreg)[1] # estimated amplitude
+c <- coef(sinreg)[2] # estimated phase shift
+d <- coef(sinreg)[3] # estimaded midline
+monthly_averages <- monthly_averages %>%
+  mutate( # compute predicted and residual mean counts
+    PREDICTED_MEAN = a*sin(2*pi*MONTH/12 + c) + d, 
+    RESIDUAL = MEAN - PREDICTED_MEAN
+  )
+```
+
+### Checking model assumptions
+
+The $p$-values computed in `sinreg` are based on the assumptions that (1) the true number of shootings can be represented as the sum of a sinusoidal variable plus an independent error term, (2) the error term is normally distributed with mean $0$, and (3) variance does not depend on month. The predictions and residuals from the model can be used to check these assumptions.
+
+1. The plot below compares the values predicted by `sinreg` to the residuals in the observed data. There is no apparent relationship between the predicted and residual values, suggesting that the error term in the seasonal model is independent.
+
+```{r independence, echo = TRUE}
+ggplot(data = monthly_averages, mapping = aes(x = PREDICTED_MEAN, y = RESIDUAL)) +
+  geom_point() +
+  labs(x = "Predicted mean shooting count", 
+    y = "Residual mean shooting count", 
+    title = "Residual vs. predicted mean shooting counts"
+    )
+```
+
+
+2. Next is the Q--Q plot of the residuals in `monthly_average` against a normal distribution. The overall linearity of this plot suggests that the residuals are plausibly normal, and the observed mean of the residuals is $-1.64 \times 10^{-8} \approx 0$.
+
+```{r residual qq}
+qqnorm(monthly_averages$RESIDUAL)
+```
+
+3. Finally, the plot below shows the variances versus the predicted mean number of shootings. Variance seems to increase with the predicted mean shooting count, which violates one of the model assumptions.
+
+```{r homoscedasticity}
+ggplot(data = monthly_averages, mapping = aes(x = PREDICTED_MEAN, y = VAR)) +
+  geom_point() +
+  labs(x = "Predicted mean shooting count",
+    y = "Variance of shooting counts", 
+    title = "Variance vs. predicted mean shooting counts"
+    )
+```
+
+A common step after observing a relationship between variance and the input variable in question is to take the logarithm of the output variable and run the regression again. The following code block records mean log shooting counts and variances for each month in a new table `log_monthly_averages` and produces a new regression model `sinreg2`.
+
+```{r regression on log counts}
+log_monthly_averages <- shootings_by_month %>% group_by(MONTH) %>% 
+  summarise( # compute mean log counts and variances of log counts by month
+    MEAN  = mean(log(NUM_OCCUR)),
+    VAR = var(log(NUM_OCCUR))
+    )
+x <- log_monthly_averages$MONTH
+y <- log_monthly_averages$MEAN
+start_values <- c(a = 1/2*(max(y) - min(y)), c = 0, d = mean(y)) #first approximations
+sinreg2 <- nls(y ~ a*sin(2*pi*x/12 + c) + d, start = start_values)
+a <- coef(sinreg2)[1] # estimated amplitude
+c <- coef(sinreg2)[2] # estimated phase shift
+d <- coef(sinreg2)[3] # estimated midline
+log_monthly_averages <- log_monthly_averages %>%
+  mutate( # compute predicted and residual log mean counts 
+    PREDICTED_MEAN = a*sin(2*pi*MONTH/12 + c) + d, 
+    RESIDUAL = MEAN - PREDICTED_MEAN
+  )
+log_monthly_averages
+summary(sinreg2)
+ggplot(log_monthly_averages, aes(x = MONTH, y = MEAN)) + geom_point() +
+  geom_smooth(
+    method = "nls", formula = y ~ a*sin(2*pi*x/12 + c) + d, 
+    method.args = list(start = start_values), 
+    se = FALSE
+    ) +
+  labs( x = "Month", 
+    y = "Mean log shooting count", 
+    title = "Mean log shooting count by month of the year"
+    ) +
+  scale_x_continuous(breaks = 1:12)
+ggplot(data = log_monthly_averages, mapping = aes(x = PREDICTED_MEAN, y = RESIDUAL)) +
+  geom_point() +
+  labs(x = "Predicted mean log shooting count", 
+    y = "Residual mean log shooting count", 
+    title = "Residual vs. predicted mean log shooting counts"
+    )
+qqnorm(log_monthly_averages$RESIDUAL)
+ggplot(data = log_monthly_averages, mapping = aes(x = PREDICTED_MEAN, y = VAR)) +
+  geom_point() +
+  labs(x = "Predicted mean log shooting count",
+    y = "Variance of log shooting count", 
+    title = "Variance vs. predicted mean log shooting count"
+    )
+```
+
+In this new model, residuals still appear to be independent and normally distributed with mean $1.32 \times 10^{-13} \approx 0$, and now variance seems much more plausibly uniform (with the exception of the variance in the January log shooting counts, which is noticeably lower than the variances for any of the other months). 
+
+## Conclusion
+
+### Validity of the seasonal model
+
+Visually, the fit of `sinreg2` to the data in `log_monthly_averages` is very convincing, and seasonal variation in the number of shootings is intuitively very plausible. A measurement of confidence in the presence of this seasonal effect is the $p$-value associated with the amplitude in `sinreg2`. The fact that this $p$-value is so low ($1.01 \times 10^{-5}$) is strong evidence that seasonality is indeed present.
+
+### Sources of bias
+
+The foregoing analysis is potentially subject to various forms of external bias.
+
+1. The data might be subject to certain kinds of sampling biases. For instance, some perpetrators may be able hide evidence of shootings in which they were involved, and some surviving victims may wish to avoid reporting shootings to the police if the victims themselves were involved in criminal activity at the time of the shooting. The shootings in situations like these are systematically undercounted.  
+
+2. There may be bias in how data is reported. This is because police officials might have motivations to see crime statistics reported as low (e.g., to be seen as effectively controlling criminal behavior) or high (e.g., to see changes in funding or policies related to the police department). 
+
+The analysis is also subject to my personal bias in a couple ways. 
+
+1. I chose only to analyze the frequency of the shooting events. This means that I did not consider any potentially informative lines of investigation related to demographics. However, this decision means that my analysis was less likely to be affected by any preconceptions I have about how demographic factors are related to crime. Moreover, I can always follow up this analysis with a look at other aspects of the original data file to look for additional insights I missed.
+
+2. I strongly suspected that there was a seasonal pattern to the shooting incidents based on my intuition that shooting frequency varies with season, weather, temperature, time spent outdoors, and so on. The analysis could have been subject to a confirmation bias, so it was important for me to check model assumptions. When one of those assumptions appeared to be violated, I stated that fact, applied a commonly-used transformation, and ran the regression analysis again. The resulting model is more reliable, despite any confirmation bias on my part, because the underlying assumptions are more plausibly true.
+
+### Questions for further investigation
+
+The following code block computes residuals for each month from 2006 until 2023 by taking the value predicted by `sinreg2` as the logarithm of the predicted count for each month. The residuals are plotted below.
+
+```{r residual shootings by month}
+shootings_by_month <- shootings_by_month %>% mutate(
+  PREDICTED_NUM = exp(a*sin(2*pi*MONTH/12 + c) + d), 
+  RESIDUAL = NUM_OCCUR - PREDICTED_NUM
+  )
+ggplot(data = shootings_by_month, mapping = aes(x = MONTH_AS_DATE, y = RESIDUAL)) +
+  geom_point() +
+  labs(x = "Date",
+    y = "Residual shooting count", 
+    title = "Residual shootings by month, 2006 - 2023"
+    )
+```
+
+There is still plenty of variability in the data and a few apparent patterns that might be worth investigating. For instance, in 2006--2019, shooting frequency appears to decline steadily and variance appears to be fairly uniform. Starting in about 2020, shooting frequency appears to increase and variance seems to be more erratic. With further research and analysis, one might find a way to explain or model these phenomena.
